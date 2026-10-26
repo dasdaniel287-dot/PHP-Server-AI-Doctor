@@ -36,6 +36,63 @@ function exportLargeDataSet() {
 }
 
 exportLargeDataSet();`,
+    solution: {
+      title: 'PHP Fatal: Allowed Memory Size (128M) Exhausted in Data Processing',
+      severity: 'Critical (500 Internal Server Error)',
+      affectedComponent: 'php.ini / PHP-FPM Resource Limits',
+      summary: 'The PHP execution process exceeded the default 128MB memory limit while accumulating 250,000 array elements in RAM before output.',
+      rootCause: 'Default php.ini memory_limit is 128M. Generating massive JSON payloads into a single PHP array loads hundreds of megabytes into memory at once, triggering an out-of-memory fatal error.',
+      oneClickFix: {
+        fixName: 'Increase memory_limit to 512M and stream large datasets chunk-by-chunk',
+        targetFileName: 'export.php',
+        fixedContent: `<?php
+declare(strict_types=1);
+
+// Production-ready streamed export with optimized memory footprint
+function exportLargeDataSetStream(): void {
+    // Elevate memory limit and execution timeout safely for export worker
+    ini_set('memory_limit', '512M');
+    set_time_limit(180);
+
+    header('Content-Type: application/json; charset=utf-8');
+    header('X-Accel-Buffering: no'); // Disable FastCGI buffering for true streaming
+    
+    echo '[';
+    // Chunked generator keeps RAM usage constant under 18MB
+    for ($i = 0; $i < 250000; $i++) {
+        $record = [
+            'id' => $i,
+            'uuid' => bin2hex(random_bytes(16)),
+            'payload' => 'Data chunk for record ' . $i,
+            'timestamp' => date('Y-m-d H:i:s'),
+        ];
+        echo json_encode($record, JSON_UNESCAPED_SLASHES);
+        if ($i < 249999) {
+            echo ',';
+        }
+        if ($i % 5000 === 0) {
+            flush(); // Flush buffer to client periodically
+        }
+    }
+    echo ']';
+}
+
+exportLargeDataSetStream();`,
+        diffExplanation: 'Replaced monolithic in-memory array accumulation with streamed chunked JSON, and raised memory_limit to 512M.',
+        terminalCommands: [
+          "sudo sed -i 's/^memory_limit = .*/memory_limit = 512M/' /etc/php/8.3/fpm/php.ini",
+          'sudo systemctl restart php8.3-fpm',
+          'sudo nginx -t && sudo systemctl reload nginx',
+        ],
+        configSnippet: 'memory_limit = 512M\nmax_execution_time = 180',
+      },
+      preventionTips: [
+        'Use PHP yield generators for large database queries (e.g. PDO unbuffered queries or chunking).',
+        'Configure memory_limit in php-fpm pool conf (php_admin_value[memory_limit] = 512M).',
+        'Set up monitoring for OOM worker killed events in /var/log/php8.3-fpm.log.',
+      ],
+      verificationCheck: 'curl -I http://localhost/api/export-orders # Expect HTTP 200 OK',
+    },
   },
   {
     id: 'fpm-sock-permission',
@@ -67,9 +124,46 @@ systemctl status php8.3-fpm:
     location ~ \\.php$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
-        # Missing buffer tuning and permission alignment
     }
 }`,
+    solution: {
+      title: '502 Bad Gateway: PHP-FPM Unix Socket Permission Denied',
+      severity: 'Critical (502 Bad Gateway)',
+      affectedComponent: 'PHP-FPM Pool / Unix Socket Permissions',
+      summary: 'Nginx worker process (running as www-data) cannot read/write to /var/run/php/php8.3-fpm.sock due to restrictive permissions.',
+      rootCause: 'The PHP-FPM unix socket was created with root:root ownership and 0600 mode instead of www-data:www-data mode 0660.',
+      oneClickFix: {
+        fixName: 'Align listen.owner, listen.group, and listen.mode in www.conf',
+        targetFileName: '/etc/php/8.3/fpm/pool.d/www.conf',
+        fixedContent: `[www]
+user = www-data
+group = www-data
+
+listen = /var/run/php/php8.3-fpm.sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+
+pm = dynamic
+pm.max_children = 50
+pm.start_servers = 5
+pm.min_spare_servers = 5
+pm.max_spare_servers = 35`,
+        diffExplanation: 'Configured listen.owner = www-data, listen.group = www-data, and listen.mode = 0660 so Nginx can access the FastCGI socket.',
+        terminalCommands: [
+          'sudo chown www-data:www-data /var/run/php/php8.3-fpm.sock',
+          'sudo chmod 660 /var/run/php/php8.3-fpm.sock',
+          'sudo systemctl restart php8.3-fpm',
+          'sudo nginx -t && sudo systemctl reload nginx',
+        ],
+        configSnippet: 'listen.owner = www-data\nlisten.group = www-data\nlisten.mode = 0660',
+      },
+      preventionTips: [
+        'Ensure www.conf listen.owner matches the user defined at the top of nginx.conf.',
+        'Avoid creating socket files in /tmp if systemd PrivateTmp=true is enabled.',
+      ],
+      verificationCheck: 'sudo ls -la /var/run/php/php8.3-fpm.sock # Verify srw-rw---- www-data www-data',
+    },
   },
   {
     id: 'pdo-mysql-refused',
@@ -91,7 +185,6 @@ Stack trace:
 namespace App;
 
 use PDO;
-use PDOException;
 
 class Database {
     public static function connect(): PDO {
@@ -107,6 +200,52 @@ class Database {
         ]);
     }
 }`,
+    solution: {
+      title: 'Fatal PDOException: Connection Refused inside Docker Network',
+      severity: 'Critical (Database Down)',
+      affectedComponent: 'PDO MySQL / Docker Networking',
+      summary: 'PHP tried to connect to MySQL on 127.0.0.1 inside a Docker container, where MySQL runs on a separate container host ("db").',
+      rootCause: 'Inside Docker Compose bridge networks, each container has its own localhost (127.0.0.1). Services must connect via the service name (e.g. host=db or DB_HOST env var).',
+      oneClickFix: {
+        fixName: 'Dynamic host resolution via getenv("DB_HOST") ?: "db"',
+        targetFileName: 'config/database.php',
+        fixedContent: `<?php
+namespace App;
+
+use PDO;
+use PDOException;
+
+class Database {
+    public static function connect(): PDO {
+        // Use environment variable with fallback to Docker service hostname 'db'
+        $host = getenv('DB_HOST') ?: 'db';
+        $port = getenv('DB_PORT') ?: '3306';
+        $db   = getenv('DB_NAME') ?: 'production_app';
+        $user = getenv('DB_USER') ?: 'root';
+        $pass = getenv('DB_PASS') ?: 'secret123';
+
+        $dsn = "mysql:host={$host};port={$port};dbname={$db};charset=utf8mb4";
+
+        return new PDO($dsn, $user, $pass, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ]);
+    }
+}`,
+        diffExplanation: 'Replaced hardcoded 127.0.0.1 with dynamic environment lookup defaulting to Docker service name "db".',
+        terminalCommands: [
+          'docker compose up -d db',
+          'docker compose exec app php -r "require \'config/database.php\'; App\\Database::connect(); echo \'DB Connected!\n\';"',
+        ],
+        configSnippet: 'DB_HOST=db\nDB_PORT=3306\nDB_NAME=production_app',
+      },
+      preventionTips: [
+        'Always read database connection coordinates from environment variables (12-Factor App methodology).',
+        'Verify both containers share the same network in docker-compose.yml.',
+      ],
+      verificationCheck: 'docker compose exec app php -m | grep pdo_mysql',
+    },
   },
   {
     id: 'headers-already-sent',
@@ -134,6 +273,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 ?>`,
+    solution: {
+      title: 'PHP Warning: Headers Already Sent by Preceding Whitespace or UTF-8 BOM',
+      severity: 'Warning / Session Failure',
+      affectedComponent: 'PHP Output Buffering & Header Pipeline',
+      summary: 'Output buffering started prematurely because invisible leading whitespace existed before the opening <?php tag.',
+      rootCause: 'HTTP headers (including Set-Cookie for sessions and Location redirects) must precede any response body. Whitespace sent early causes PHP to seal headers immediately.',
+      oneClickFix: {
+        fixName: 'Remove leading whitespace, enable ob_start(), and omit closing ?> tag',
+        targetFileName: 'auth/login.php',
+        fixedContent: `<?php
+declare(strict_types=1);
+
+// Enable output buffering to prevent header conflicts
+ob_start();
+
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $user = $_POST['user'] ?? '';
+    if ($user === 'admin') {
+        $_SESSION['authenticated'] = true;
+        header('Location: /dashboard.php');
+        exit;
+    }
+}
+// Note: Omit closing ?> tag per PSR-12 standard to prevent accidental trailing whitespace`,
+        diffExplanation: 'Removed leading whitespace, wrapped with ob_start(), added session_status check, and stripped closing PHP tag.',
+        terminalCommands: [
+          "sed -i '1s/^\\s*//' auth/login.php",
+          'php -l auth/login.php',
+        ],
+        configSnippet: 'output_buffering = 4096',
+      },
+      preventionTips: [
+        'Never include a closing ?> tag in pure PHP files (PSR-12 standard).',
+        'Ensure your text editor saves files as UTF-8 without BOM (Byte Order Mark).',
+      ],
+    },
   },
   {
     id: 'curl-ssl-cainfo',
@@ -158,6 +337,34 @@ Stack trace:
 ; [openssl]
 ; The location of a Certificate Authority (CA) file on the local machine
 ; openssl.cafile = `,
+    solution: {
+      title: 'cURL Error 60: SSL Certificate Problem (unable to get local issuer certificate)',
+      severity: 'Critical (Outbound API Failure)',
+      affectedComponent: 'php.ini / OpenSSL CA Bundle (curl.cainfo)',
+      summary: 'PHP cannot verify TLS/SSL certificates of external APIs (Stripe, PayPal, GitHub, AWS) due to missing CA bundle.',
+      rootCause: 'cURL relies on a Certificate Authority (CA) cert bundle to verify HTTPS remote hosts. In Windows/XAMPP or minimal Linux, curl.cainfo is empty.',
+      oneClickFix: {
+        fixName: 'Download official Mozilla cacert.pem and configure curl.cainfo in php.ini',
+        targetFileName: 'php.ini',
+        fixedContent: `[curl]
+curl.cainfo = "/etc/ssl/certs/cacert.pem"
+
+[openssl]
+openssl.cafile = "/etc/ssl/certs/cacert.pem"`,
+        diffExplanation: 'Configured curl.cainfo and openssl.cafile to point to the system root certificates bundle.',
+        terminalCommands: [
+          'sudo apt-get update && sudo apt-get install -y ca-certificates',
+          'sudo curl -sS https://curl.se/ca/cacert.pem -o /etc/ssl/certs/cacert.pem',
+          "sudo sed -i 's|;curl.cainfo =.*|curl.cainfo = \"/etc/ssl/certs/cacert.pem\"|' /etc/php/8.3/fpm/php.ini",
+          'sudo systemctl restart php8.3-fpm',
+        ],
+        configSnippet: 'curl.cainfo = "/etc/ssl/certs/cacert.pem"\nopenssl.cafile = "/etc/ssl/certs/cacert.pem"',
+      },
+      preventionTips: [
+        'Run update-ca-certificates on Ubuntu/Debian periodically.',
+        'Never disable CURLOPT_SSL_VERIFYPEER in production as it leaves transactions vulnerable to MITM attacks.',
+      ],
+    },
   },
   {
     id: 'laravel-key-permissions',
@@ -186,6 +393,43 @@ DB_PORT=3306
 DB_DATABASE=laravel_prod
 DB_USERNAME=laravel_user
 DB_PASSWORD=`,
+    solution: {
+      title: 'Laravel 500: Missing APP_KEY & storage/logs Permission Denied',
+      severity: 'Critical (Laravel 500)',
+      affectedComponent: 'Laravel Environment & Linux File Ownership',
+      summary: 'Laravel cannot boot because the encryption cipher has no secret key, and the web server user cannot write logs.',
+      rootCause: 'Fresh deployments missing `php artisan key:generate` and storage/ + bootstrap/cache are owned by root rather than www-data.',
+      oneClickFix: {
+        fixName: 'Generate APP_KEY and adjust permissions to 775 with www-data ownership',
+        targetFileName: '.env',
+        fixedContent: `APP_NAME=LaravelApp
+APP_ENV=production
+APP_KEY=base64:9ZqB+F8zK2dM1xT3vQ4yN5rL8wX7pE0aB2c4D6e8F0g=
+APP_DEBUG=false
+APP_URL=https://my-app.example.com
+
+LOG_CHANNEL=stack
+LOG_LEVEL=error
+
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=laravel_prod
+DB_USERNAME=laravel_user
+DB_PASSWORD=secret`,
+        diffExplanation: 'Generated secure base64 AES-256 encryption key and prepared permissions for storage directory.',
+        terminalCommands: [
+          'php artisan key:generate',
+          'sudo chown -R www-data:www-data storage bootstrap/cache',
+          'sudo chmod -R 775 storage bootstrap/cache',
+          'php artisan config:cache && php artisan route:cache',
+        ],
+      },
+      preventionTips: [
+        'Include `chown -R www-data:www-data storage bootstrap/cache` in your deployment script.',
+        'Always run `php artisan config:cache` in production deployments.',
+      ],
+    },
   },
   {
     id: 'composer-missing-ext',
@@ -212,6 +456,55 @@ WORKDIR /var/www/html
 COPY . .
 
 CMD ["php-fpm"]`,
+    solution: {
+      title: 'Fatal Error: Class "PDO" Not Found / Missing PHP Extensions',
+      severity: 'Critical (Fatal Class Not Found)',
+      affectedComponent: 'Docker Alpine PHP-FPM Extensions',
+      summary: 'The Alpine container image does not compile or enable pdo_mysql, mbstring, or intl extensions.',
+      rootCause: 'Official PHP Alpine images only ship with core PHP; database and multibyte extensions must be installed via docker-php-ext-install.',
+      oneClickFix: {
+        fixName: 'Install build dependencies and compile pdo, pdo_mysql, intl, and mbstring',
+        targetFileName: 'Dockerfile',
+        fixedContent: `FROM php:8.3-fpm-alpine
+
+# Install build dependencies
+RUN apk add --no-cache \\
+    icu-dev \\
+    oniguruma-dev \\
+    curl \\
+    libpng-dev \\
+    git
+
+# Install and enable required PHP extensions
+RUN docker-php-ext-configure intl \\
+    && docker-php-ext-install -j$(nproc) \\
+        pdo \\
+        pdo_mysql \\
+        intl \\
+        mbstring \\
+        opcache
+
+WORKDIR /var/www/html
+
+COPY . .
+
+RUN chown -R www-data:www-data /var/www/html
+
+EXPOSE 9000
+
+CMD ["php-fpm"]`,
+        diffExplanation: 'Added apk dependencies and docker-php-ext-install commands for pdo, pdo_mysql, intl, and mbstring.',
+        terminalCommands: [
+          'docker compose build --no-cache app',
+          'docker compose up -d app',
+          'docker compose exec app php -m',
+        ],
+      },
+      preventionTips: [
+        'Verify required extensions before building with `composer check-platform-reqs`.',
+        'Use multi-stage Docker builds to keep final production image lightweight.',
+      ],
+    },
   },
   {
     id: 'nginx-try-files',
@@ -241,5 +534,208 @@ CMD ["php-fpm"]`,
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
     }
 }`,
+    solution: {
+      title: 'Nginx 404 Not Found on API Routes (Missing try_files)',
+      severity: 'Configuration Error (404 Not Found)',
+      affectedComponent: 'Nginx Location Block Routing',
+      summary: 'Nginx treats API paths like /v1/users/login as literal disk files instead of passing them to front controller public/index.php.',
+      rootCause: 'Without `try_files $uri $uri/ /index.php?$query_string;`, Nginx tries to open the path literally on the filesystem.',
+      oneClickFix: {
+        fixName: 'Add try_files directive to route all virtual paths through index.php',
+        targetFileName: '/etc/nginx/sites-available/api.conf',
+        fixedContent: `server {
+    listen 80;
+    server_name api.example.com;
+    root /var/www/api/public;
+    index index.php index.html;
+
+    # Properly route all dynamic requests to front controller
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \\.php$ {
+        include fastcgi_params;
+        fastcgi_pass 127.0.0.1:9000;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_buffer_size 128k;
+        fastcgi_buffers 4 256k;
+    }
+}`,
+        diffExplanation: 'Added `try_files $uri $uri/ /index.php?$query_string;` to route clean URLs into index.php.',
+        terminalCommands: [
+          'sudo nginx -t',
+          'sudo systemctl reload nginx',
+        ],
+      },
+      preventionTips: [
+        'Always run `nginx -t` before reloading configuration in production.',
+      ],
+    },
+  },
+  {
+    id: 'wordpress-critical-error',
+    name: 'WordPress "There has been a critical error on this website"',
+    badge: 'WP 500',
+    category: 'Laravel/WP',
+    quickDescription: 'White Screen of Death / Critical Error due to memory limit and faulty plugin hook.',
+    environment: 'Apache / Shared cPanel',
+    serverType: 'Apache mod_php',
+    phpVersion: 'PHP 8.2',
+    targetFileName: 'wp-config.php',
+    errorLog: `Fatal error: Allowed memory size of 67108864 bytes exhausted (tried to allocate 20480 bytes) in /home/user/public_html/wp-includes/plugin.php on line 205
+There has been a critical error on this website. Please check your site admin email inbox for instructions.`,
+    codeSnippet: `<?php
+// wp-config.php snippet
+define( 'DB_NAME', 'wp_database' );
+define( 'DB_USER', 'wp_user' );
+define( 'DB_PASSWORD', 'password123' );
+define( 'DB_HOST', 'localhost' );
+
+// Debugging is currently disabled, concealing true error
+define( 'WP_DEBUG', false );
+// Default WP memory limit is only 40M / 64M!
+/* That's all, stop editing! Happy publishing. */`,
+    solution: {
+      title: 'WordPress "Critical Error on this website" (WSOD)',
+      severity: 'Critical (WordPress 500 Down)',
+      affectedComponent: 'wp-config.php / WP_MEMORY_LIMIT',
+      summary: 'WordPress ran out of memory (64MB) during plugin initialization, resulting in the generic critical error screen.',
+      rootCause: 'Default WordPress memory allocation is only 40MB for frontend and 64MB for admin, insufficient for WooCommerce, Elementor, or heavy plugins.',
+      oneClickFix: {
+        fixName: 'Increase WP_MEMORY_LIMIT to 256M and enable WP_DEBUG_LOG',
+        targetFileName: 'wp-config.php',
+        fixedContent: `<?php
+define( 'DB_NAME', 'wp_database' );
+define( 'DB_USER', 'wp_user' );
+define( 'DB_PASSWORD', 'password123' );
+define( 'DB_HOST', 'localhost' );
+
+// Increase WordPress Memory Limit
+define( 'WP_MEMORY_LIMIT', '256M' );
+define( 'WP_MAX_MEMORY_LIMIT', '512M' );
+
+// Safe error logging without exposing errors to site visitors
+define( 'WP_DEBUG', true );
+define( 'WP_DEBUG_LOG', true );
+define( 'WP_DEBUG_DISPLAY', false );
+@ini_set( 'display_errors', 0 );
+
+/* That's all, stop editing! Happy publishing. */`,
+        diffExplanation: 'Elevated WP_MEMORY_LIMIT to 256M and configured private file logging to wp-content/debug.log.',
+        terminalCommands: [
+          "sudo sed -i \"/stop editing/i define( 'WP_MEMORY_LIMIT', '256M' );\" wp-config.php",
+          'sudo service apache2 restart',
+        ],
+      },
+      preventionTips: [
+        'Check wp-content/debug.log for plugins triggering repeated memory allocation bursts.',
+      ],
+    },
+  },
+  {
+    id: 'apache-htaccess-loop',
+    name: 'Apache 500: Request exceeded limit of 10 internal redirects (RewriteRule loop)',
+    badge: 'Apache 500',
+    category: 'Nginx/Apache',
+    quickDescription: 'Infinite redirect rewrite loop in .htaccess crashes Apache with HTTP 500.',
+    environment: 'Ubuntu VPS / Apache 2.4',
+    serverType: 'Apache mod_php',
+    phpVersion: 'PHP 8.3',
+    targetFileName: '.htaccess',
+    errorLog: `[Sun Oct 26 16:42:01.819201 2026] [core:error] [pid 4912] [client 192.168.1.101:54201] AH00124: Request exceeded the limit of 10 internal redirects due to probable configuration error. Use 'LimitInternalRecursion' to increase the limit if necessary. Use 'LogLevel debug' to get a backtrace.`,
+    codeSnippet: `<IfModule mod_rewrite.c>
+    RewriteEngine On
+    # Flawed: Missing RewriteCond %{REQUEST_FILENAME} !-f causing infinite recursion!
+    RewriteRule ^(.*)$ index.php [L,QSA]
+</IfModule>`,
+    solution: {
+      title: 'Apache 500: Request Exceeded Limit of 10 Internal Redirects',
+      severity: 'Critical (Internal Server Error)',
+      affectedComponent: 'Apache mod_rewrite / .htaccess',
+      summary: 'Apache enters an infinite rewrite loop rewriting index.php to index.php until it exceeds the 10-redirect recursion limit.',
+      rootCause: 'RewriteRule lacks conditions to exclude existing files and directories (`RewriteCond %{REQUEST_FILENAME} !-f`).',
+      oneClickFix: {
+        fixName: 'Add file and directory exclusion conditions before RewriteRule',
+        targetFileName: '.htaccess',
+        fixedContent: `<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+
+    # Prevent loop by checking if requested target is already a physical file or folder
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^ index.php [L,QSA]
+</IfModule>`,
+        diffExplanation: 'Added RewriteCond !-f and !-d to protect physical assets and stop recursion.',
+        terminalCommands: [
+          'sudo a2enmod rewrite',
+          'sudo systemctl restart apache2',
+        ],
+      },
+      preventionTips: [
+        'Always check RewriteCond !-f before single-entry router rules.',
+      ],
+    },
+  },
+  {
+    id: 'php84-dynamic-property',
+    name: 'PHP 8.4 Deprecated: Creation of Dynamic Property is Deprecated',
+    badge: 'PHP 8.4',
+    category: 'Headers & Output',
+    quickDescription: 'PHP 8.4 fatal deprecation when assigning uninitialized properties to classes.',
+    environment: 'Ubuntu 24.04 / PHP 8.4',
+    serverType: 'Nginx + PHP-FPM',
+    phpVersion: 'PHP 8.4',
+    targetFileName: 'src/UserSession.php',
+    errorLog: `Deprecated: Creation of dynamic property App\\UserSession::$jwtToken is deprecated in /var/www/html/src/UserSession.php on line 14
+Deprecated: Creation of dynamic property App\\UserSession::$lastActive is deprecated in /var/www/html/src/UserSession.php on line 15`,
+    codeSnippet: `<?php
+namespace App;
+
+// Missing #[\AllowDynamicProperties] or declared class properties
+class UserSession {
+    public function __construct(string $username) {
+        $this->username = $username;
+        $this->jwtToken = bin2hex(random_bytes(32));
+        $this->lastActive = time();
+    }
+}`,
+    solution: {
+      title: 'PHP 8.4 Deprecated: Creation of Dynamic Property is Deprecated',
+      severity: 'Warning / Strict Exception',
+      affectedComponent: 'PHP 8.4 Strict OOP / Class Properties',
+      summary: 'PHP 8.2+ deprecates and PHP 8.4+ restricts dynamic undeclared properties, throwing exceptions in strict frameworks.',
+      rootCause: 'Properties `$username`, `$jwtToken`, and `$lastActive` were assigned without prior declaration on the class.',
+      oneClickFix: {
+        fixName: 'Declare typed class properties or add #[\AllowDynamicProperties]',
+        targetFileName: 'src/UserSession.php',
+        fixedContent: `<?php
+declare(strict_types=1);
+
+namespace App;
+
+class UserSession {
+    public string $username;
+    public string $jwtToken;
+    public int $lastActive;
+
+    public function __construct(string $username) {
+        $this->username = $username;
+        $this->jwtToken = bin2hex(random_bytes(32));
+        $this->lastActive = time();
+    }
+}`,
+        diffExplanation: 'Declared typed class properties `public string $username`, `public string $jwtToken`, and `public int $lastActive`.',
+        terminalCommands: [
+          'php -l src/UserSession.php',
+        ],
+      },
+      preventionTips: [
+        'Declare all class properties explicitly with strict types.',
+        'Use #[\AllowDynamicProperties] attribute only as temporary bridge for legacy code.',
+      ],
+    },
   },
 ];

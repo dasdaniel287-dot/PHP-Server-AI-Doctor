@@ -28,6 +28,7 @@ export interface PresetProblem {
   serverType: string;
   phpVersion: string;
   quickDescription: string;
+  solution?: DiagnosticResult;
 }
 
 export interface ProjectFile {
