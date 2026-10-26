@@ -1,0 +1,6 @@
+{
+  "name": "PHP Server AI Doctor & GitHub Project Forge",
+  "description": "One-click AI diagnostic and instant repair tool for PHP server errors, configs, and bugs with direct 1-click GitHub repository creator and project scaffolding.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
